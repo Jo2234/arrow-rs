@@ -33,6 +33,9 @@
 //! cargo run --features=cli --bin parquet-rewrite -- -i XYZ.parquet -o XYZ2.parquet
 //! ```
 
+#[path = "cli/output.rs"]
+mod output;
+
 use std::fs::File;
 
 use arrow_array::RecordBatchReader;
@@ -224,7 +227,7 @@ struct Args {
     #[clap(short, long)]
     input: String,
 
-    /// Path to output parquet file.
+    /// Path to output parquet file, atomically replaced on success (symlinks are replaced).
     #[clap(short, long)]
     output: String,
 
@@ -418,8 +421,9 @@ fn main() {
         writer_properties_builder = writer_properties_builder.set_write_batch_size(value);
     }
     let writer_properties = writer_properties_builder.build();
+    let mut output = output::OutputFile::new(&args.output).expect("Unable to open output file");
     let mut parquet_writer = ArrowWriter::try_new(
-        File::create(&args.output).expect("Unable to open output file"),
+        output.file(),
         parquet_reader.schema(),
         Some(writer_properties),
     )
@@ -431,4 +435,5 @@ fn main() {
     }
 
     parquet_writer.close().expect("finalizing file");
+    output.finish().expect("replacing output file");
 }

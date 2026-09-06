@@ -1014,101 +1014,99 @@ mod tests {
     }
 
     #[test]
-    fn test_long_string_view_allocation() {
-        // The JSON input contains field "a" with different string lengths.
-        // According to the implementation in the decoder:
-        // - For a string, capacity is only increased if its length > 12 bytes.
-        // Therefore, for:
-        // Row 1: "short" (5 bytes) -> capacity += 0
-        // Row 2: "this is definitely long" (24 bytes) -> capacity += 24
-        // Row 3: "hello" (5 bytes) -> capacity += 0
-        // Row 4: "\nfoobar😀asfgÿ" (17 bytes) -> capacity += 17
-        // Expected total capacity = 24 + 17 = 41
-        let expected_capacity: usize = 41;
-
-        let buf = r#"
-        {"a": "short", "b": "dummy"}
-        {"a": "this is definitely long", "b": "dummy"}
-        {"a": "hello", "b": "dummy"}
-        {"a": "\nfoobar😀asfgÿ", "b": "dummy"}
-        "#;
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("a", DataType::Utf8View, true),
-            Field::new("b", DataType::LargeUtf8, true),
-        ]));
-
-        let batches = do_read(buf, 1024, false, false, schema);
-        assert_eq!(batches.len(), 1, "Expected one record batch");
-
-        // Get the first column ("a") as a StringViewArray.
-        let col_a = batches[0].column(0);
-        let string_view_array = col_a
-            .as_any()
-            .downcast_ref::<StringViewArray>()
-            .expect("Column should be a StringViewArray");
-
-        // Retrieve the underlying data buffer from the array.
-        // The builder pre-allocates capacity based on the sum of lengths for long strings.
-        let data_buffer = string_view_array.to_data().buffers()[0].len();
-
-        // Check that the allocated capacity is at least what we expected.
-        // (The actual buffer may be larger than expected due to rounding or internal allocation strategies.)
-        assert!(
-            data_buffer >= expected_capacity,
-            "Data buffer length ({data_buffer}) should be at least {expected_capacity}",
-        );
-
-        // Additionally, verify that the decoded values are correct.
-        assert_eq!(string_view_array.value(0), "short");
-        assert_eq!(string_view_array.value(1), "this is definitely long");
-        assert_eq!(string_view_array.value(2), "hello");
-        assert_eq!(string_view_array.value(3), "\nfoobar😀asfgÿ");
+    fn test_string_view_capacity_tracks_rows() {
+        for length in [5, 1024] {
+            let rows: Vec<_> = (0..1024)
+                .map(|i| (i % 4 != 0).then(|| "x".repeat(length)))
+                .collect();
+            let mut decoder =
+                ReaderBuilder::new_with_field(Field::new("s", DataType::Utf8View, true))
+                    .build_decoder()
+                    .unwrap();
+            decoder.serialize(&rows).unwrap();
+            let batch = decoder.flush().unwrap().unwrap();
+            let array = batch.column(0).as_string_view();
+            assert_eq!(
+                array.iter().collect::<Vec<_>>(),
+                rows.iter().map(|s| s.as_deref()).collect::<Vec<_>>()
+            );
+            // The view buffer stores one u128 per row, independent of string byte lengths.
+            assert!(
+                array.views().inner().capacity() <= rows.len() * std::mem::size_of::<u128>() * 2,
+                "view buffer retained {} bytes for {} rows",
+                array.views().inner().capacity(),
+                rows.len()
+            );
+        }
     }
 
-    /// Test the memory capacity allocation logic when converting numeric types to strings.
     #[test]
-    fn test_numeric_view_allocation() {
-        // For numeric types, the expected capacity calculation is as follows:
-        // Row 1: 123456789  -> Number converts to the string "123456789" (length 9), 9 <= 12, so no capacity is added.
-        // Row 2: 1000000000000 -> Treated as an I64 number; its string is "1000000000000" (length 13),
-        //                        which is >12 and its absolute value is > 999_999_999_999, so 13 bytes are added.
-        // Row 3: 3.1415 -> F32 number, a fixed estimate of 10 bytes is added.
-        // Row 4: 2.718281828459045 -> F64 number, a fixed estimate of 10 bytes is added.
-        // Total expected capacity = 13 + 10 + 10 = 33 bytes.
-        let expected_capacity: usize = 33;
+    fn test_serialize_f32_to_strings() {
+        let values = [
+            1.5_f32,
+            -2.5,
+            0.0,
+            -0.0,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ];
+        let expected = ["1.5", "-2.5", "0.0", "-0.0", "NaN", "inf", "-inf"];
+        for data_type in [DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View] {
+            let mut decoder =
+                ReaderBuilder::new_with_field(Field::new("s", data_type.clone(), false))
+                    .with_coerce_primitive(true)
+                    .build_decoder()
+                    .unwrap();
+            decoder.serialize(&values).unwrap();
+            let batch = decoder.flush().unwrap().unwrap();
+            let actual: Vec<_> = match data_type {
+                DataType::Utf8 => batch.column(0).as_string::<i32>().iter().collect(),
+                DataType::LargeUtf8 => batch.column(0).as_string::<i64>().iter().collect(),
+                DataType::Utf8View => batch.column(0).as_string_view().iter().collect(),
+                _ => unreachable!(),
+            };
+            assert_eq!(actual, expected.map(Some));
+        }
+    }
 
-        let buf = r#"
-    {"n": 123456789}
-    {"n": 1000000000000}
-    {"n": 3.1415}
-    {"n": 2.718281828459045}
-    "#;
-
-        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Utf8View, true)]));
-
-        let batches = do_read(buf, 1024, true, false, schema);
-        assert_eq!(batches.len(), 1, "Expected one record batch");
-
-        let col_n = batches[0].column(0);
-        let string_view_array = col_n
-            .as_any()
-            .downcast_ref::<StringViewArray>()
-            .expect("Column should be a StringViewArray");
-
-        // Check that the underlying data buffer capacity is at least the expected value.
-        let data_buffer = string_view_array.to_data().buffers()[0].len();
-        assert!(
-            data_buffer >= expected_capacity,
-            "Data buffer length ({data_buffer}) should be at least {expected_capacity}",
+    #[test]
+    fn test_serialize_min_i64_to_string_view() {
+        let mut decoder = ReaderBuilder::new_with_field(Field::new("s", DataType::Utf8View, false))
+            .with_coerce_primitive(true)
+            .build_decoder()
+            .unwrap();
+        decoder.serialize(&[i64::MIN, i64::MAX]).unwrap();
+        let batch = decoder.flush().unwrap().unwrap();
+        assert_eq!(
+            batch.column(0).as_string_view().value(0),
+            i64::MIN.to_string()
         );
+        assert_eq!(
+            batch.column(0).as_string_view().value(1),
+            i64::MAX.to_string()
+        );
+    }
 
-        // Verify that the converted string values are correct.
-        // Note: The format of the number converted to a string should match the actual implementation.
-        assert_eq!(string_view_array.value(0), "123456789");
-        assert_eq!(string_view_array.value(1), "1000000000000");
-        assert_eq!(string_view_array.value(2), "3.1415");
-        assert_eq!(string_view_array.value(3), "2.718281828459045");
+    #[test]
+    fn test_string_view_conflicting_types() {
+        for ignore in [false, true] {
+            let mut reader =
+                ReaderBuilder::new_with_field(Field::new("s", DataType::Utf8View, true))
+                    .with_ignore_type_conflicts(ignore)
+                    .build(b"\"valid\"\n{}\n[]\n123\n".as_slice())
+                    .unwrap();
+            let result = reader.next().unwrap();
+            if ignore {
+                let batch = result.unwrap();
+                assert_eq!(
+                    batch.column(0).as_string_view().iter().collect::<Vec<_>>(),
+                    vec![Some("valid"), None, None, None]
+                );
+            } else {
+                assert!(result.is_err());
+            }
+        }
     }
 
     #[test]

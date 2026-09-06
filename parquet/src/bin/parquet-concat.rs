@@ -36,6 +36,9 @@
 //! Note: this does not currently support preserving the page index or bloom filters
 //!
 
+#[path = "cli/output.rs"]
+mod output;
+
 use clap::Parser;
 use parquet::bloom_filter::Sbbf;
 use parquet::column::writer::ColumnCloseResult;
@@ -51,7 +54,7 @@ use std::sync::Arc;
 #[clap(author, version)]
 /// Concatenates one or more parquet files
 struct Args {
-    /// Path to output
+    /// Path to output, atomically replaced on success (symlinks are replaced).
     output: String,
 
     /// Path to input files
@@ -69,8 +72,6 @@ impl Args {
                 "Must provide at least one input file".into(),
             ));
         }
-
-        let output = File::create(&self.output)?;
 
         let inputs = self
             .input
@@ -97,7 +98,8 @@ impl Args {
 
         let props = Arc::new(WriterProperties::builder().build());
         let schema = inputs[0].1.file_metadata().schema_descr().root_schema_ptr();
-        let mut writer = SerializedFileWriter::new(output, schema, props)?;
+        let mut output = output::OutputFile::new(&self.output)?;
+        let mut writer = SerializedFileWriter::new(output.file(), schema, props)?;
 
         for (input, metadata) in inputs {
             let column_indexes = metadata.column_index();
@@ -128,8 +130,7 @@ impl Args {
         }
 
         writer.close()?;
-
-        Ok(())
+        output.finish()
     }
 }
 
