@@ -60,7 +60,9 @@ pub fn b64_decode<E: Engine, O: OffsetSizeTrait>(
     engine: &E,
     array: &GenericBinaryArray<O>,
 ) -> Result<GenericBinaryArray<O>, ArrowError> {
-    let estimated_len = array.values().len(); // This is an overestimate
+    // A slice can share a much larger values buffer. Reserve only its logical span.
+    let value_offsets = array.value_offsets();
+    let estimated_len = value_offsets[array.len()].as_usize() - value_offsets[0].as_usize();
     let mut buffer = vec![0; estimated_len];
 
     let mut offsets = Vec::with_capacity(array.len() + 1);
@@ -79,13 +81,15 @@ pub fn b64_decode<E: Engine, O: OffsetSizeTrait>(
     // Safety: offsets monotonically increasing by construction
     let offsets = unsafe { OffsetBuffer::new_unchecked(offsets.into()) };
 
+    buffer.truncate(offset);
+    buffer.shrink_to_fit();
     GenericBinaryArray::try_new(offsets, Buffer::from_vec(buffer), array.nulls().cloned())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::BinaryArray;
+    use arrow_array::{BinaryArray, LargeBinaryArray};
     use rand::{Rng, rng};
 
     fn test_engine<E: Engine>(e: &E, a: &BinaryArray) {
@@ -112,5 +116,39 @@ mod tests {
 
         test_engine(&BASE64_STANDARD, &data);
         test_engine(&BASE64_STANDARD_NO_PAD, &data);
+    }
+
+    #[test]
+    fn test_b64_decode_sliced_buffer() {
+        let input = BinaryArray::from(vec![b"YQ==".as_slice(); 100_000]);
+        let slice = input.slice(50_000, 1);
+        let decoded = b64_decode(&BASE64_STANDARD, &slice).unwrap();
+
+        assert_eq!(decoded, BinaryArray::from(vec![b"a".as_slice()]));
+        assert_eq!(decoded.values().len(), 1);
+        assert_eq!(decoded.values().capacity(), 1);
+        decoded.to_data().validate_full().unwrap();
+    }
+
+    #[test]
+    fn test_b64_decode_sliced_null_and_empty_values() {
+        let input = LargeBinaryArray::from(vec![
+            Some(b"aWdub3Jl".as_slice()),
+            None,
+            Some(b"".as_slice()),
+            Some(b"YWJj".as_slice()),
+            Some(b"aWdub3Jl".as_slice()),
+        ]);
+        let decoded = b64_decode(&BASE64_STANDARD, &input.slice(1, 3)).unwrap();
+        let expected =
+            LargeBinaryArray::from(vec![None, Some(b"".as_slice()), Some(b"abc".as_slice())]);
+        assert_eq!(decoded, expected);
+        assert_eq!(decoded.values().len(), 3);
+        assert_eq!(decoded.values().capacity(), 3);
+        decoded.to_data().validate_full().unwrap();
+
+        let empty = b64_decode(&BASE64_STANDARD, &input.slice(2, 0)).unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(empty.values().capacity(), 0);
     }
 }

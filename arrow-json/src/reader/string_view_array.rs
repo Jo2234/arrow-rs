@@ -46,72 +46,8 @@ impl StringViewArrayDecoder {
 impl ArrayDecoder for StringViewArrayDecoder {
     fn decode(&mut self, tape: &Tape<'_>, pos: &[u32]) -> Result<ArrayRef, ArrowError> {
         let coerce = self.coerce_primitive;
-        let mut data_capacity = 0;
-        for &p in pos {
-            // note that StringView is different that StringArray in that only
-            // "long" strings (longer than 12 bytes) are stored in the buffer.
-            // "short" strings are inlined into a fixed length structure.
-            match tape.get(p) {
-                TapeElement::String(idx) => {
-                    let s = tape.get_string(idx);
-                    // Only increase capacity if the string length is greater than 12 bytes
-                    if s.len() > 12 {
-                        data_capacity += s.len();
-                    }
-                }
-                TapeElement::Null => {
-                    // Do not increase capacity for null values
-                }
-                // For booleans, do not increase capacity (both "true" and "false" are less than
-                // 12 bytes)
-                TapeElement::True if coerce => {}
-                TapeElement::False if coerce => {}
-                // For Number, use the same strategy as for strings
-                TapeElement::Number(idx) if coerce => {
-                    let s = tape.get_string(idx);
-                    if s.len() > 12 {
-                        data_capacity += s.len();
-                    }
-                }
-                // For I64, only add capacity if the absolute value is greater than 999,999,999,999
-                // (the largest number that can fit in 12 bytes)
-                TapeElement::I64(_) if coerce => {
-                    match tape.get(p + 1) {
-                        TapeElement::I32(_) => {
-                            let high = match tape.get(p) {
-                                TapeElement::I64(h) => h,
-                                _ => unreachable!(),
-                            };
-                            let low = match tape.get(p + 1) {
-                                TapeElement::I32(l) => l,
-                                _ => unreachable!(),
-                            };
-                            let val = ((high as i64) << 32) | (low as u32) as i64;
-                            if val.abs() > 999_999_999_999 {
-                                // Only allocate capacity based on the string representation if the number is large
-                                data_capacity += val.to_string().len();
-                            }
-                        }
-                        _ => unreachable!(),
-                    }
-                }
-                // For I32, do not increase capacity (the longest string representation is <= 12 bytes)
-                TapeElement::I32(_) if coerce => {}
-                // For F32 and F64, keep the existing estimate
-                TapeElement::F32(_) if coerce => {
-                    data_capacity += 10;
-                }
-                TapeElement::F64(_) if coerce => {
-                    data_capacity += 10;
-                }
-                _ if self.ignore_type_conflicts => {} // treat type conflicts like nulls
-                _ => {
-                    return Err(tape.error(p, "string"));
-                }
-            }
-        }
-
-        let mut builder = GenericByteViewBuilder::<StringViewType>::with_capacity(data_capacity);
+        let mut builder = GenericByteViewBuilder::<StringViewType>::with_capacity(pos.len());
+        let mut float_formatter = ryu::Buffer::new();
         // Temporary buffer to avoid per-iteration allocation for numeric types
         let mut tmp_buf = String::new();
 
@@ -148,9 +84,7 @@ impl ArrayDecoder for StringViewArrayDecoder {
                     builder.append_value(&tmp_buf);
                 }
                 TapeElement::F32(n) if coerce => {
-                    tmp_buf.clear();
-                    write!(&mut tmp_buf, "{n}").unwrap();
-                    builder.append_value(&tmp_buf);
+                    builder.append_value(float_formatter.format(f32::from_bits(n)));
                 }
                 TapeElement::F64(high) if coerce => match tape.get(p + 1) {
                     TapeElement::F32(low) => {
@@ -164,7 +98,7 @@ impl ArrayDecoder for StringViewArrayDecoder {
                 _ if self.ignore_type_conflicts => {
                     builder.append_null();
                 }
-                _ => unreachable!(),
+                _ => return Err(tape.error(p, "string")),
             }
         }
 

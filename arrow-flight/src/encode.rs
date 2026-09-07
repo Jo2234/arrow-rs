@@ -499,7 +499,7 @@ fn prepare_field_for_flight(
             field.is_nullable(),
         )
         .with_metadata(field.metadata().clone()),
-        DataType::LargeList(inner) => Field::new_list(
+        DataType::LargeList(inner) => Field::new_large_list(
             field.name(),
             prepare_field_for_flight(inner, dictionary_tracker, send_dictionaries),
             field.is_nullable(),
@@ -1784,6 +1784,53 @@ mod tests {
         let batch2 = RecordBatch::try_new(schema, vec![Arc::new(arr2)]).unwrap();
 
         verify_flight_round_trip(vec![batch1, batch2]).await;
+    }
+
+    #[tokio::test]
+    async fn test_large_list_round_trip_both_dictionary_modes() {
+        let simple = LargeListArray::from_iter_primitive::<Int32Type, _, _>([
+            Some(vec![Some(1), None, Some(2)]),
+            None,
+            Some(vec![]),
+        ]);
+        let mut nested = builder::LargeListBuilder::new(builder::LargeListBuilder::new(
+            builder::Int32Builder::new(),
+        ));
+        nested.values().append_value([Some(1), Some(2)]);
+        nested.values().append_null();
+        nested.append(true);
+        nested.append(false);
+        nested.values().append_value([Some(3)]);
+        nested.append(true);
+        for array in [
+            Arc::new(simple) as ArrayRef,
+            Arc::new(nested.finish()) as ArrayRef,
+        ] {
+            let field = Field::new("list", array.data_type().clone(), true)
+                .with_metadata(HashMap::from([("custom".into(), "preserved".into())]));
+            let batch =
+                RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![array]).unwrap();
+            for mode in [DictionaryHandling::Hydrate, DictionaryHandling::Resend] {
+                let encoder = FlightDataEncoderBuilder::new()
+                    .with_schema(batch.schema())
+                    .with_dictionary_handling(mode)
+                    .build(futures::stream::iter([Ok(batch.clone())]));
+                assert_eq!(encoder.known_schema(), Some(batch.schema()));
+                let mut decoder = FlightDataDecoder::new(encoder);
+                let mut batch_count = 0;
+                while let Some(message) = decoder.next().await {
+                    match message.unwrap().payload {
+                        DecodedPayload::Schema(schema) => assert_eq!(schema, batch.schema()),
+                        DecodedPayload::RecordBatch(actual) => {
+                            assert_eq!(actual, batch);
+                            batch_count += 1;
+                        }
+                        DecodedPayload::None => {}
+                    }
+                }
+                assert_eq!(batch_count, 1);
+            }
+        }
     }
 
     async fn verify_flight_round_trip(batches: Vec<RecordBatch>) {
